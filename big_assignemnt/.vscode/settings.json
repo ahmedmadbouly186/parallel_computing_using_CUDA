@@ -1,0 +1,9 @@
+{
+    "files.associations": {
+        "mutex": "cpp",
+        "shared_mutex": "cpp",
+        "syncstream": "cpp",
+        "thread": "cpp",
+        "source_location": "cpp"
+    }
+}

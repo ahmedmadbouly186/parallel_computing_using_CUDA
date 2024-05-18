@@ -1,0 +1,2 @@
+gcc tsp_cpu_solver.c -o tsp_solver -lm
+./tsp_solver edges.txt
