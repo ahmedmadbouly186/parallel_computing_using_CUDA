@@ -67,11 +67,11 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
     ull numPerms = end_perm - start_perm;
     ull idx = blockIdx.x * blockDim.x + threadIdx.x;
     min_paths[idx + start_idx] = DBL_MAX;
-    if (idx >= numPerms)
-    {
+    // if (idx >= numPerms)
+    // {
 
-        return;
-    }
+    //     return;
+    // }
 
     // prepare shared memory
     extern __shared__ ull shared_array[];
@@ -95,6 +95,11 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
             shared_graph[threadIdx.x * graph_load_thread + i] = graph[threadIdx.x * graph_load_thread + i];
         }
     }
+    if (idx >= numPerms)
+    {
+
+        return;
+    }
     __syncthreads();
 
     ull total_threads = blockDim.x * gridDim.x;
@@ -102,7 +107,7 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
     ull *path = new ull[numVertices];
 
     short *best_path_thread = &best_paths[(idx + start_idx) * numVertices];
-    double best_cost_thread = min_path[0];
+    double best_cost_thread = DBL_MAX;
     for (ull path_num = idx * permutatins_per_thread; path_num < (idx + 1) * permutatins_per_thread; path_num++)
     {
         if (path_num >= numPerms)
@@ -130,7 +135,6 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
             }
         }
     }
-    // printf("Thread %d: %lf\n", idx + start_idx, best_cost_thread);
     min_paths[idx + start_idx] = best_cost_thread;
 
     delete[] path;
@@ -241,13 +245,12 @@ int main(int argc, char **argv)
         ull start_idx = i * numBlocks * blockSize;
         if (end_perm > numPerms)
             end_perm = numPerms;
-        printf("Stream %d: %llu %llu\n", i, start_perm, end_perm);
         calculatePathWeight<<<numBlocks, blockSize, shared_mem_size, stream[i]>>>(d_graph, d_fact, d_min_path, d_best_path, d_lock, start_idx, start_perm, end_perm, (ull)N, d_min_paths, d_best_paths);
     }
     cudaDeviceSynchronize(); // Synchronize across all blocks
     ull total_threads = blockSize * numBlocks * nStreams;
-    if (total_threads > numPerms)
-        total_threads = numPerms;
+    // if (total_threads > numPerms)
+    //     total_threads = numPerms;
     chooseBestPath<<<1, 1, 0>>>(total_threads, d_min_path, d_best_path, N, d_min_paths, d_best_paths);
     cudaDeviceSynchronize(); // Synchronize across all blocks
     for (int i = 0; i < nStreams; ++i)
