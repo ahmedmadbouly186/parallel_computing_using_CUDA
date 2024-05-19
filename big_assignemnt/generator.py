@@ -64,9 +64,12 @@ def create_graph(n, edges):
         graph[v][u] = w
     return graph
 
-# Driver Code 
-if __name__ == "__main__": 
-    V = 12
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python script_name.py <number_of_vertices>")
+        sys.exit(1)
+    
+    V = int(sys.argv[1])
     filename = "edges.txt"
 
     # Generate a random test case and save to file

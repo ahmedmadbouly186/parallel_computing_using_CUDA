@@ -31,6 +31,7 @@ __device__ int lock_me(int *mutex, int id)
 
 __device__ void unlock_me(int *mutex, int id)
 {
+
     atomicExch((int *)(mutex + id), 0);
 }
 
@@ -63,12 +64,15 @@ __host__ void calculateFactorials(ull n, ull *fact)
     }
 }
 
-__global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, int *best_path, int *lock, ull start_perm, ull end_perm, ull numVertices)
+__global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, int *best_path, int *lock, ull numPerms, ull numVertices, double *min_paths, short *best_paths)
 {
-    ull numPerms = end_perm - start_perm;
     ull idx = blockIdx.x * blockDim.x + threadIdx.x;
+    min_paths[idx] = DBL_MAX;
     if (idx >= numPerms)
+    {
+
         return;
+    }
 
     // prepare shared memory
     extern __shared__ ull shared_array[];
@@ -98,14 +102,14 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
     ull permutatins_per_thread = (numPerms + total_threads - 1) / total_threads;
     ull *path = new ull[numVertices];
 
-    ull *best_path_thread = new ull[numVertices];
+    short *best_path_thread = &best_paths[idx * numVertices];
     double best_cost_thread = min_path[0];
     for (ull path_num = idx * permutatins_per_thread; path_num < (idx + 1) * permutatins_per_thread; path_num++)
     {
         if (path_num >= numPerms)
             break;
-        ull actual_path_num = path_num + start_perm;
-        ithpermutation(numVertices, actual_path_num, shared_factorial, path);
+
+        ithpermutation(numVertices, path_num, shared_factorial, path);
         double current_pathweight = 0;
         for (ull j = 1; j < numVertices; j++)
         {
@@ -122,37 +126,42 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
             best_cost_thread = current_pathweight;
             for (int i = 0; i < numVertices; i++)
             {
-                best_path_thread[i] = path[i];
+                best_path_thread[i] = (short)path[i];
             }
         }
     }
+    // printf("Thread %d: %lf\n", idx, best_cost_thread);
+    min_paths[idx] = best_cost_thread;
 
-    int successfull = 0;
-    while (!successfull)
+    delete[] path;
+}
+__global__ void chooseBestPath(ull total_threads, double *min_path, int *best_path, ull numVertices, double *min_paths, short *best_paths)
+{
+    ull idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx == 0)
     {
-        if (lock_me(lock, 0))
-        { // lock acquired?
-            unlock_me(lock, 0);
-            successfull = 1;
+        double min = DBL_MAX;
+        int min_idx = 0;
+        for (int i = 0; i < total_threads; i++)
+        {
+            if (min_paths[i] < min)
+            {
+                min = min_paths[i];
+                min_idx = i;
+            }
         }
-    }
-
-    if (best_cost_thread < min_path[0])
-    {
-        min_path[0] = best_cost_thread;
+        min_path[0] = min;
+        short *best_path_thread = &best_paths[min_idx * numVertices];
         for (int i = 0; i < numVertices; i++)
         {
             best_path[i] = best_path_thread[i];
         }
     }
-
-    unlock_me(lock, 0);
-
-    delete[] path;
 }
-
 int main(int argc, char **argv)
 {
+    ull blockSize = 1024;
+    ull numBlocks = 15;
 
     char *file_name;
     if (argc != 2)
@@ -178,7 +187,6 @@ int main(int argc, char **argv)
     int *h_best_path;
     double h_min_path = DBL_MAX;
     int h_lock = 0;
-
     // allocate the host memory using cudaMallocHost, to allocate it in the pinned memory which is faster to access
     // pinned memory is faster to access than pageable memory because it is directly accessible from the direct memory access (DMA) engine of the GPU
     // The only difference is that the allocated memory cannot be paged by the OS
@@ -189,62 +197,38 @@ int main(int argc, char **argv)
     readGraphFromFile(file, h_graph, N);
     calculateFactorials((ull)N, h_fact);
 
-    double *d_graph;
-    ull *d_fact;
-    double *d_min_path;
-    int *d_best_path;
-    int *d_lock;
+    double *d_graph;    // device graph
+    ull *d_fact;        // device fact
+    double *d_min_path; // device min value
+    int *d_best_path;   // device best path
+    int *d_lock;        // device lock
+
+    double *d_min_paths; // device min paths
+    short *d_best_paths; // device best paths for all threads
+
+    cudaMalloc(&d_best_paths, blockSize * numBlocks * N * sizeof(short));
+    cudaMalloc(&d_min_paths, blockSize * numBlocks * sizeof(double));
+
     cudaMalloc(&d_best_path, N * sizeof(int));
     cudaMalloc(&d_graph, N * N * sizeof(double));
     cudaMalloc(&d_fact, (N + 1) * sizeof(ull));
     cudaMalloc(&d_min_path, sizeof(double));
     cudaMalloc(&d_lock, sizeof(int));
 
-    ull shred_fac_size = (N + 1) * sizeof(ull);
-    ull shred_graph_size = N * N * sizeof(double);
-    ull shared_mem_size = shred_fac_size + shred_graph_size;
-    const int nStreams = 3;
-    cudaStream_t stream[nStreams];
-    for (int i = 0; i < nStreams; ++i)
-        cudaStreamCreate(&stream[i]);
+    cudaMemcpy(d_graph, h_graph, N * N * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fact, h_fact, (N + 1) * sizeof(ull), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_min_path, &h_min_path, sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lock, &h_lock, sizeof(int), cudaMemcpyHostToDevice);
 
-    // loop over copy, loop over kernel, loop over copy
-    for (int i = 0; i < nStreams; ++i)
-    {
-        cudaMemcpyAsync(d_graph, h_graph, N * N * sizeof(double), cudaMemcpyHostToDevice, stream[i]);
-        cudaMemcpyAsync(d_fact, h_fact, (N + 1) * sizeof(ull), cudaMemcpyHostToDevice, stream[i]);
-        cudaMemcpyAsync(d_min_path, &h_min_path, sizeof(double), cudaMemcpyHostToDevice, stream[i]);
-        cudaMemcpyAsync(d_lock, &h_lock, sizeof(int), cudaMemcpyHostToDevice, stream[i]);
-    }
     ull numPerms = h_fact[N];
-    ull num_perm_per_stream = (numPerms + nStreams - 1) / nStreams;
-    const ull blockSize = 1024;
-    const ull numBlocks = 5;
-    for (int i = 0; i < nStreams; ++i)
-    {
-        ull start_perm = i * num_perm_per_stream;
-        ull end_perm = (i + 1) * num_perm_per_stream;
-        if (end_perm > numPerms)
-            end_perm = numPerms;
-        calculatePathWeight<<<numBlocks, blockSize, shared_mem_size, stream[i]>>>(d_graph, d_fact, d_min_path, d_best_path, d_lock, start_perm, end_perm, (ull)N);
-    }
-    for (int i = 0; i < nStreams; ++i)
-    {
-        cudaMemcpyAsync(h_best_path, d_best_path, N * sizeof(int), cudaMemcpyDeviceToHost, stream[i]);
-        cudaMemcpyAsync(&h_min_path, d_min_path, sizeof(double), cudaMemcpyDeviceToHost, stream[i]);
-    }
-    // Synchronize the streams to ensure all operations are complete
-    for (int i = 0; i < nStreams; ++i)
-    {
-        cudaStreamSynchronize(stream[i]);
-    }
 
-    // Destroy the streams
-    for (int i = 0; i < nStreams; ++i)
-    {
-        cudaStreamDestroy(stream[i]);
-    }
+    calculatePathWeight<<<numBlocks, blockSize, N * N * sizeof(double) + (N + 1) * sizeof(ull)>>>(d_graph, d_fact, d_min_path, d_best_path, d_lock, numPerms, (ull)N, d_min_paths, d_best_paths);
+    cudaDeviceSynchronize(); // Synchronize across all blocks
+    chooseBestPath<<<1, 1, 0>>>(numBlocks * blockSize, d_min_path, d_best_path, N, d_min_paths, d_best_paths);
+    cudaDeviceSynchronize(); // Synchronize across all blocks
 
+    cudaMemcpy(h_best_path, d_best_path, N * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_min_path, d_min_path, sizeof(double), cudaMemcpyDeviceToHost);
     printf("\n\nMinimum Path Weight: %lf\n\n", h_min_path);
     printf("Best Path: ");
     for (int i = 0; i < N; i++)
@@ -252,12 +236,10 @@ int main(int argc, char **argv)
         printf("%d ", h_best_path[i]);
     }
     printf("\n");
-
     cudaFree(d_best_path);
     cudaFree(d_graph);
     cudaFree(d_fact);
     cudaFree(d_min_path);
-    cudaFree(d_lock);
     cudaFreeHost(h_graph);
     cudaFreeHost(h_fact);
     cudaFreeHost(h_best_path);

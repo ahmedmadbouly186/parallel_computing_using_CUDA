@@ -62,13 +62,16 @@ __host__ void calculateFactorials(ull n, ull *fact)
         fact[i] = fact[i - 1] * i;
     }
 }
-
-__global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, int *best_path, int *lock, ull start_perm, ull end_perm, ull numVertices)
+__global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, int *best_path, int *lock, ull start_idx, ull start_perm, ull end_perm, ull numVertices, double *min_paths, short *best_paths)
 {
     ull numPerms = end_perm - start_perm;
     ull idx = blockIdx.x * blockDim.x + threadIdx.x;
+    min_paths[idx] = DBL_MAX;
     if (idx >= numPerms)
+    {
+
         return;
+    }
 
     // prepare shared memory
     extern __shared__ ull shared_array[];
@@ -98,13 +101,14 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
     ull permutatins_per_thread = (numPerms + total_threads - 1) / total_threads;
     ull *path = new ull[numVertices];
 
-    ull *best_path_thread = new ull[numVertices];
+    short *best_path_thread = &best_paths[(idx + start_idx) * numVertices];
     double best_cost_thread = min_path[0];
     for (ull path_num = idx * permutatins_per_thread; path_num < (idx + 1) * permutatins_per_thread; path_num++)
     {
         if (path_num >= numPerms)
             break;
         ull actual_path_num = path_num + start_perm;
+
         ithpermutation(numVertices, actual_path_num, shared_factorial, path);
         double current_pathweight = 0;
         for (ull j = 1; j < numVertices; j++)
@@ -122,35 +126,38 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
             best_cost_thread = current_pathweight;
             for (int i = 0; i < numVertices; i++)
             {
-                best_path_thread[i] = path[i];
+                best_path_thread[i] = (short)path[i];
             }
         }
     }
+    // printf("Thread %d: %lf\n", idx, best_cost_thread);
+    min_paths[idx + start_idx] = best_cost_thread;
 
-    int successfull = 0;
-    while (!successfull)
+    delete[] path;
+}
+__global__ void chooseBestPath(ull total_threads, double *min_path, int *best_path, ull numVertices, double *min_paths, short *best_paths)
+{
+    ull idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx == 0)
     {
-        if (lock_me(lock, 0))
-        { // lock acquired?
-            unlock_me(lock, 0);
-            successfull = 1;
+        double min = DBL_MAX;
+        int min_idx = 0;
+        for (int i = 0; i < total_threads; i++)
+        {
+            if (min_paths[i] < min)
+            {
+                min = min_paths[i];
+                min_idx = i;
+            }
         }
-    }
-
-    if (best_cost_thread < min_path[0])
-    {
-        min_path[0] = best_cost_thread;
+        min_path[0] = min;
+        short *best_path_thread = &best_paths[min_idx * numVertices];
         for (int i = 0; i < numVertices; i++)
         {
             best_path[i] = best_path_thread[i];
         }
     }
-
-    unlock_me(lock, 0);
-
-    delete[] path;
 }
-
 int main(int argc, char **argv)
 {
 
@@ -189,11 +196,18 @@ int main(int argc, char **argv)
     readGraphFromFile(file, h_graph, N);
     calculateFactorials((ull)N, h_fact);
 
-    double *d_graph;
-    ull *d_fact;
-    double *d_min_path;
-    int *d_best_path;
-    int *d_lock;
+    double *d_graph;    // device graph
+    ull *d_fact;        // device fact
+    double *d_min_path; // device min value
+    int *d_best_path;   // device best path
+    int *d_lock;        // device lock
+    const int nStreams = 3;
+
+    double *d_min_paths; // device min paths
+    short *d_best_paths; // device best paths for all threads
+    cudaMalloc(&d_best_paths, blockSize * numBlocks * N * nStreams * sizeof(short));
+    cudaMalloc(&d_min_paths, blockSize * numBlocks * nStreams * sizeof(double));
+
     cudaMalloc(&d_best_path, N * sizeof(int));
     cudaMalloc(&d_graph, N * N * sizeof(double));
     cudaMalloc(&d_fact, (N + 1) * sizeof(ull));
@@ -203,7 +217,6 @@ int main(int argc, char **argv)
     ull shred_fac_size = (N + 1) * sizeof(ull);
     ull shred_graph_size = N * N * sizeof(double);
     ull shared_mem_size = shred_fac_size + shred_graph_size;
-    const int nStreams = 3;
     cudaStream_t stream[nStreams];
     for (int i = 0; i < nStreams; ++i)
         cudaStreamCreate(&stream[i]);
@@ -224,10 +237,15 @@ int main(int argc, char **argv)
     {
         ull start_perm = i * num_perm_per_stream;
         ull end_perm = (i + 1) * num_perm_per_stream;
+
+        ull start_idx = i * numBlocks * blockSize;
         if (end_perm > numPerms)
             end_perm = numPerms;
-        calculatePathWeight<<<numBlocks, blockSize, shared_mem_size, stream[i]>>>(d_graph, d_fact, d_min_path, d_best_path, d_lock, start_perm, end_perm, (ull)N);
+        calculatePathWeight<<<numBlocks, blockSize, shared_mem_size, stream[i]>>>(d_graph, d_fact, d_min_path, d_best_path, d_lock, start_idx, start_perm, end_perm, (ull)N, d_min_paths, d_best_paths);
     }
+    cudaDeviceSynchronize(); // Synchronize across all blocks
+    chooseBestPath<<<1, 1, 0>>>(numBlocks * blockSize * nStreams, d_min_path, d_best_path, N, d_min_paths, d_best_paths);
+    cudaDeviceSynchronize(); // Synchronize across all blocks
     for (int i = 0; i < nStreams; ++i)
     {
         cudaMemcpyAsync(h_best_path, d_best_path, N * sizeof(int), cudaMemcpyDeviceToHost, stream[i]);

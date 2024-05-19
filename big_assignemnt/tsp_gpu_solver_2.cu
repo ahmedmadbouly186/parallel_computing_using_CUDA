@@ -132,6 +132,7 @@ __global__ void calculatePathWeight(double *graph, ull *fact, double *min_path, 
     {
         if (lock_me(lock, 0))
         { // lock acquired?
+            unlock_me(lock, 0);
             successfull = 1;
         }
     }
